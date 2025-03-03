@@ -65,6 +65,25 @@ def expand_properties(df, properties_col='properties'):
 
     return df
 
+def sub(text):
+    """
+    PyG не любит кириллические символы и прочие знаки в названиях типов,
+    поэтому заменяем их на латиницу/цифры.
+    """
+    text = re.sub(r'[^a-zA-ZА-Яа-я0-9]', '', text)
+    translit_map = {
+        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e',
+        'ё': 'yo', 'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k',
+        'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r',
+        'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'ts',
+        'ч': 'ch', 'ш': 'sh', 'щ': 'sch', 'ъ': '', 'ы': 'y', 'ь': '',
+        'э': 'e', 'ю': 'yu', 'я': 'ya'
+    }
+
+    result = ''
+    for char in text.lower():
+        result += translit_map.get(char, char)
+    return result
 
 def build_connections_graph(
     entity_folder: str = ENTITY_DIR,
@@ -186,12 +205,16 @@ def build_hetero_graph_data(
     undirected: bool = False,
     do_expand: bool = True,
     do_one_hot_properties: bool = True
-) -> Tuple[HeteroData, dict]:
+) -> HeteroData:
     """
-    Строит разнородный граф (HeteroData), а также применяет one-hot encoding для property_* столбцов.
+    Строит разнородный граф (HeteroData), при этом:
+        - Распаковывает 'properties' (если do_expand=True),
+        - Делает one-hot для столбцов property_* (если do_one_hot_properties=True),
+        - Находит дубликаты по 'id', сохраняет их в отдельные файлы real_duplicates_{node_type}.csv,
+        и убирает эти дубликаты из основного набора (чтобы не попадали в граф).
 
-    Параметры:
-    ----------
+    Параметры
+    ---------
     entity_folder : str
         Путь к папке с CSV-файлами, содержащими сущности.
     relation_folder : str
@@ -200,16 +223,21 @@ def build_hetero_graph_data(
         Какие типы узлов (_type_name) включить в граф.
     included_edge_types : iterable / None
         Какие типы связей (_type_name) включить в граф.
+    node_features_names : dict
+        Указание, какие колонки считать фичами для каждого типа узлов, напр.:
+            { "СКЗИ": ["property_Подтип СКЗИ_1", ...], ... }
+    undirected : bool
+        Делать ли граф неориентированным (дублируя рёбра в обратную сторону).
     do_expand : bool
-        Нужно ли распаковывать колонку 'properties' в CSV (expand_properties).
+        Нужно ли распаковывать колонку 'properties'.
     do_one_hot_properties : bool
-        Нужно ли делать one-hot encoding для всех строковых колонок, начинающихся с 'property_'.
+        Нужно ли делать one-hot encoding для property_* колонок.
 
-    Возвращает:
-    -----------
+    Возвращает
+    ----------
     data : HeteroData
-        Гетрогенный граф PyG.
     """
+
     if included_node_types is None:
         included_node_types = set()
     else:
@@ -248,20 +276,8 @@ def build_hetero_graph_data(
     for node_type, rows in nodes_by_type.items():
         df_nodes = pd.DataFrame(rows)
 
-        # Удалим дубликаты по 'id' (на случай, если что-то дублируется)
-        # print("before dedup", node_type, len(df_nodes))
-        # Сохраняем дубликаты перед удалением
-        # duplicate_nodes = df_nodes[df_nodes.duplicated(subset='id', keep=False)].copy()
-
         # Убираем дубликаты из основного набора
         df_nodes.drop_duplicates(subset='id', inplace=True)
-
-        # Генерируем имя файла, зависящее от типа узла
-        # file_name = f"./data/real_duplicates_{node_type}.csv"
-
-        # Сохраняем дубликаты для данного типа узлов
-        # duplicate_nodes.to_csv(file_name, index=False)
-        # print("after dedup", len(df_nodes))
 
         # Если нужно делать one-hot для property_* столбцов:
         if do_one_hot_properties:
@@ -312,20 +328,6 @@ def build_hetero_graph_data(
 
         data[sub(node_type)].x = x
 
-        # # Create labels
-        # if node_type in node_feature_target:
-        #     values = df_nodes[node_feature_target[node_type]].unique().tolist()
-        #     labels_mapping = {}
-        #     if any(pd.isna(v) for v in values):
-        #         labels_mapping[np.nan] = -1
-        #         values = [v for v in values if not pd.isna(v)]
-        #     for i, v in enumerate(sorted(values)):
-        #         labels_mapping[v] = i
-        #     print("Labels encoding", json.dumps(labels_mapping, ensure_ascii=False))
-        #     y = torch.tensor(
-        #         [-1 if pd.isna(v) else labels_mapping[v] for v in df_nodes[node_feature_target[node_type]]], dtype=torch.long)
-        #     data[sub(node_type)].y = y
-
     # 3) Разбиваем связи по (src_type, edge_type, dst_type)
     edges_by_triplet = defaultdict(lambda: ([], []))
 
@@ -366,30 +368,8 @@ def build_hetero_graph_data(
             edge_index = torch.tensor([dst_list, src_list], dtype=torch.long)
             data[(sub(dst_t), sub(rel_t), sub(src_t))].edge_index = coalesce(edge_index)
 
-    # # Edge features - TODO
-    # for (src_t, rel_t, dst_t), (src_list, dst_list) in edges_by_triplet.items():
-    #     data[(sub(src_t), sub(rel_t), sub(dst_t))].edge_weight = torch.ones(len(src_list), dtype=torch.float)
+    return data
 
-    return data #, labels_mapping
-
-
-def sub(text):
-    """ Pytorch does not like non-letters and Cyrillic symbols as names, we replace them
-    """
-    text = re.sub(r'[^a-zA-ZА-Яа-я0-9]', '', text)
-    translit_map = {
-        'а': 'a', 'б': 'b', 'в': 'v', 'г': 'g', 'д': 'd', 'е': 'e',
-        'ё': 'yo', 'ж': 'zh', 'з': 'z', 'и': 'i', 'й': 'y', 'к': 'k',
-        'л': 'l', 'м': 'm', 'н': 'n', 'о': 'o', 'п': 'p', 'р': 'r',
-        'с': 's', 'т': 't', 'у': 'u', 'ф': 'f', 'х': 'h', 'ц': 'ts',
-        'ч': 'ch', 'ш': 'sh', 'щ': 'sch', 'ъ': '', 'ы': 'y', 'ь': '',
-        'э': 'e', 'ю': 'yu', 'я': 'ya'
-    }
-
-    result = ''
-    for char in text.lower():
-        result += translit_map.get(char, char)
-    return result
 
 
 # ---------------- Пример использования ----------------
@@ -419,8 +399,3 @@ if __name__ == "__main__":
     )
 
     print(data)
-    # for node_type in data.node_types:
-    #     print(f"Node type = {node_type}, x.shape = {data[node_type].x.shape}")
-    #
-    # for edge_type in data.edge_types:
-    #     print(f"Edge type = {edge_type}, edge_index.shape = {data[edge_type].edge_index.shape}")
